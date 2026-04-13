@@ -11,6 +11,116 @@ let messages = [];
 let realtimeChannel = null;
 let activeChatUserId = null;
 let activeChatUsername = null;
+let conversationMetaMap = new Map();
+let unreadConversations = {};
+let hasConversationBootstrap = false;
+let liveSyncIntervalId = null;
+let lastIncomingSeenByPartner = {};
+let activeProfileTab = 'account';
+let profileCache = null;
+
+const DEFAULT_PROFILE_PREFERENCES = {
+    bio: '',
+    mood: '🙂',
+    theme: 'light',
+    notifications: true,
+    sidebarSort: 'recent',
+    compactMode: false,
+    bubbleStyle: 'rounded',
+    readReceipts: true,
+    pinnedConversations: [],
+    mutedConversations: {},
+    recentConversations: [],
+    unreadConversations: {},
+    incomingSeen: {}
+};
+
+const TERMS_CONTENT = `
+<div class="terms-content">
+<h3>TERMS OF SERVICE & PRIVACY POLICY</h3>
+
+<h4>1. TERMS OF SERVICE</h4>
+
+<h5>1.1 Use License</h5>
+<p>Nuntia grants you a limited, non-exclusive, non-transferable license to use the application for personal use only.</p>
+
+<h5>1.2 User Responsibilities</h5>
+<ul>
+<li>You agree not to post illegal, harmful, or offensive content</li>
+<li>You will not harass, threaten, or abuse other users</li>
+<li>You will respect the intellectual property rights of others</li>
+<li>You understand your content may be moderated or removed</li>
+</ul>
+
+<h5>1.3 Messaging</h5>
+<ul>
+<li>Nuntia is built for private direct messages between users</li>
+<li>You are responsible for messages sent from your account</li>
+<li>We may limit abusive activity for platform safety</li>
+</ul>
+
+<h5>1.4 Limitation of Liability</h5>
+<p>Nuntia is provided "as is" without warranties. We are not liable for any damages arising from use of the platform.</p>
+
+<h5>1.5 Termination</h5>
+<p>We reserve the right to suspend or terminate accounts that violate these terms.</p>
+
+<hr>
+
+<h4>2. PRIVACY POLICY</h4>
+
+<h5>2.1 Data Collection</h5>
+<p>We collect:</p>
+<ul>
+<li>Account data (email, username)</li>
+<li>Direct messages and message metadata</li>
+<li>Profile and preferences settings</li>
+<li>Basic usage data for reliability and improvements</li>
+</ul>
+
+<h5>2.2 Data Storage</h5>
+<p>Data is stored in Supabase infrastructure.</p>
+
+<h5>2.3 Data Protection</h5>
+<ul>
+<li>Authentication is handled securely through Supabase Auth</li>
+<li>Access is controlled by database permissions and RLS policies</li>
+<li>Only participants of a DM thread should be able to read that thread</li>
+</ul>
+
+<h5>2.4 Data Sharing</h5>
+<p>We do not sell your personal data to third parties.</p>
+
+<h5>2.5 Your Rights</h5>
+<ul>
+<li>You can update your profile and settings</li>
+<li>You can delete your own messages</li>
+<li>You can request account removal through support/admin workflow</li>
+</ul>
+
+<h5>2.6 Changes to Policy</h5>
+<p>We may update this policy. Continued use means acceptance of changes.</p>
+
+<hr>
+<p><strong>By using Nuntia, you agree to these terms and privacy policy.</strong></p>
+</div>
+`;
+
+let splashRemoved = false;
+
+function removeSplash() {
+    if (splashRemoved) return;
+    splashRemoved = true;
+
+    const splash = document.getElementById('splashScreen');
+    if (!splash) return;
+
+    splash.classList.add('fade-out');
+    setTimeout(() => {
+        splash.style.display = 'none';
+        splash.remove();
+    }, 300);
+}
 
 function initSupabase() {
     if (typeof window.supabase === 'undefined') {
@@ -70,7 +180,7 @@ function showScreen(screenId) {
 }
 
 function updateActiveNav() {
-    document.querySelectorAll('.nav-btn').forEach(btn => {
+    document.querySelectorAll('[data-view]').forEach(btn => {
         const view = btn.getAttribute('data-view');
         if (view === currentView) btn.classList.add('active');
         else btn.classList.remove('active');
@@ -94,18 +204,356 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-function getConversationStorageKey() {
-    return currentUser ? `recent_conversations_${currentUser.id}` : null;
+function openTermsModal() {
+    const termsContent = document.getElementById('termsContent');
+    if (termsContent) termsContent.innerHTML = TERMS_CONTENT;
+    showModal('termsModal');
+}
+
+let prefsPersistTimeout = null;
+
+function normalizeProfilePreferences(rawPrefs) {
+    if (!rawPrefs || typeof rawPrefs !== 'object') {
+        return { ...DEFAULT_PROFILE_PREFERENCES };
+    }
+    return { ...DEFAULT_PROFILE_PREFERENCES, ...rawPrefs };
+}
+
+function getCurrentPreferences() {
+    return normalizeProfilePreferences(profileCache?.preferences);
+}
+
+function applyPreferencePatch(patch) {
+    const current = getCurrentPreferences();
+    const next = { ...current, ...patch };
+    profileCache = {
+        ...(profileCache || {}),
+        preferences: next
+    };
+    return next;
+}
+
+function queuePreferencesPersist(patch = {}) {
+    if (!currentUser) return;
+    applyPreferencePatch(patch);
+
+    if (prefsPersistTimeout) {
+        clearTimeout(prefsPersistTimeout);
+    }
+
+    prefsPersistTimeout = setTimeout(async () => {
+        prefsPersistTimeout = null;
+        if (!sb || !currentUser) return;
+
+        const prefs = getCurrentPreferences();
+        const { error } = await sb
+            .from('profiles')
+            .update({ preferences: prefs })
+            .eq('id', currentUser.id);
+
+        if (error && !String(error.message || '').toLowerCase().includes('preferences')) {
+            console.error('Failed to persist preferences:', error);
+        }
+    }, 250);
 }
 
 function loadRecentConversations() {
-    const key = getConversationStorageKey();
-    if (!key) return [];
-    try {
-        return JSON.parse(localStorage.getItem(key) || '[]');
-    } catch (_e) {
-        return [];
+    return getCurrentPreferences().recentConversations || [];
+}
+
+function saveRecentConversations(conversations) {
+    queuePreferencesPersist({ recentConversations: conversations || [] });
+}
+
+function loadUnreadConversations() {
+    return getCurrentPreferences().unreadConversations || {};
+}
+
+function saveUnreadConversations() {
+    queuePreferencesPersist({ unreadConversations });
+}
+
+function loadIncomingSeenMap() {
+    return getCurrentPreferences().incomingSeen || {};
+}
+
+function saveIncomingSeenMap() {
+    queuePreferencesPersist({ incomingSeen: lastIncomingSeenByPartner });
+}
+
+function getPinnedConversations() {
+    return getCurrentPreferences().pinnedConversations || [];
+}
+
+function getMutedConversations() {
+    return getCurrentPreferences().mutedConversations || {};
+}
+
+function getSidebarSortMode() {
+    return getCurrentPreferences().sidebarSort || 'recent';
+}
+
+function markConversationRead(userId) {
+    if (!userId) return;
+    if (unreadConversations[userId]) {
+        delete unreadConversations[userId];
+        saveUnreadConversations();
     }
+}
+
+function incrementUnreadConversation(userId) {
+    if (!userId) return;
+    unreadConversations[userId] = (unreadConversations[userId] || 0) + 1;
+    saveUnreadConversations();
+}
+
+function truncateText(text, max = 26) {
+    const value = String(text || '').trim();
+    if (value.length <= max) return value;
+    return `${value.slice(0, max)}…`;
+}
+
+function formatRelativeTime(ts) {
+    if (!ts) return '';
+    const now = Date.now();
+    const then = new Date(ts).getTime();
+    if (Number.isNaN(then)) return '';
+    const diffSec = Math.max(0, Math.floor((now - then) / 1000));
+    if (diffSec < 60) return 'now';
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`;
+    return `${Math.floor(diffSec / 86400)}d`;
+}
+
+function showIncomingToast(partnerId, previewText) {
+    const preferences = getCurrentPreferences();
+    if (preferences.notifications === false) return;
+    if (preferences.mutedConversations?.[partnerId]) return;
+
+    const partnerName = loadRecentConversations().find(c => c.id === partnerId)?.username || 'Someone';
+    showAlert(`@${partnerName}: ${truncateText(previewText, 42)}`, 'info');
+
+    if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+        new Notification(`New message from @${partnerName}`, {
+            body: truncateText(previewText, 80)
+        });
+    }
+}
+
+function trackIncomingMessage(partnerId, messageContent, createdAt, senderId) {
+    if (!partnerId || !createdAt) return;
+
+    const isIncoming = senderId && currentUser && senderId !== currentUser.id;
+    if (!isIncoming) return;
+
+    const seenStamp = lastIncomingSeenByPartner[partnerId];
+    if (seenStamp && new Date(createdAt).getTime() <= new Date(seenStamp).getTime()) {
+        return;
+    }
+
+    lastIncomingSeenByPartner[partnerId] = createdAt;
+    saveIncomingSeenMap();
+
+    if (partnerId !== activeChatUserId) {
+        incrementUnreadConversation(partnerId);
+        showIncomingToast(partnerId, messageContent || 'New message');
+    }
+}
+
+function stopLiveSync() {
+    if (liveSyncIntervalId) {
+        clearInterval(liveSyncIntervalId);
+        liveSyncIntervalId = null;
+    }
+}
+
+function startLiveSync() {
+    stopLiveSync();
+    liveSyncIntervalId = setInterval(async () => {
+        if (!currentUser) return;
+        await syncConversationsFromMessages();
+        if (activeChatUserId) {
+            await loadMessages();
+        }
+    }, 5000);
+}
+
+function saveProfilePreferencesToDb(preferences) {
+    queuePreferencesPersist(preferences || {});
+}
+
+function updateSidebarButtonLabel() {
+    const btn = document.getElementById('theme-toggle-sidebar');
+    if (!btn) return;
+    btn.textContent = document.body.classList.contains('dark-theme') ? '☀️ Light Mode' : '🌙 Dark Mode';
+}
+
+function togglePinActiveConversation() {
+    if (!activeChatUserId) {
+        showAlert('Open a direct message first.', 'info');
+        return;
+    }
+
+    const prefs = getCurrentPreferences();
+    const pinned = new Set(prefs.pinnedConversations || []);
+    if (pinned.has(activeChatUserId)) pinned.delete(activeChatUserId);
+    else pinned.add(activeChatUserId);
+
+    queuePreferencesPersist({ pinnedConversations: [...pinned] });
+    renderConversationList();
+    renderProfileContent();
+}
+
+function toggleMuteActiveConversation() {
+    if (!activeChatUserId) {
+        showAlert('Open a direct message first.', 'info');
+        return;
+    }
+
+    const prefs = getCurrentPreferences();
+    const muted = { ...(prefs.mutedConversations || {}) };
+    muted[activeChatUserId] = !muted[activeChatUserId];
+    if (!muted[activeChatUserId]) delete muted[activeChatUserId];
+
+    queuePreferencesPersist({ mutedConversations: muted });
+    renderConversationList();
+    renderProfileContent();
+}
+
+async function changePasswordFromSettings() {
+    const newPasswordInput = document.getElementById('settingsNewPassword');
+    const confirmPasswordInput = document.getElementById('settingsConfirmPassword');
+    const newPassword = newPasswordInput?.value || '';
+    const confirmPassword = confirmPasswordInput?.value || '';
+
+    if (!newPassword || !confirmPassword) {
+        showAlert('Enter and confirm your new password.', 'error');
+        return;
+    }
+    if (newPassword.length < 6) {
+        showAlert('Password must be at least 6 characters.', 'error');
+        return;
+    }
+    if (newPassword !== confirmPassword) {
+        showAlert('Passwords do not match.', 'error');
+        return;
+    }
+
+    const { error } = await sb.auth.updateUser({ password: newPassword });
+    if (error) {
+        showAlert(error.message, 'error');
+        return;
+    }
+
+    if (newPasswordInput) newPasswordInput.value = '';
+    if (confirmPasswordInput) confirmPasswordInput.value = '';
+    showAlert('Password updated successfully.', 'success');
+}
+
+function exportMyData() {
+    const payload = {
+        exportedAt: new Date().toISOString(),
+        userId: currentUser?.id || null,
+        email: currentUser?.email || null,
+        preferences: getCurrentPreferences(),
+        conversations: loadRecentConversations()
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `nuntia-export-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    showAlert('Data export downloaded.', 'success');
+}
+
+function saveAdvancedSettings() {
+    const themeValue = document.querySelector('input[name="pref-theme-chat"]:checked')?.value || 'light';
+    const notificationsValue = document.getElementById('prefNotificationsToggle')?.checked ?? true;
+    const sortValue = document.getElementById('sidebarSortSelect')?.value || 'recent';
+
+    queuePreferencesPersist({
+        theme: themeValue,
+        notifications: notificationsValue,
+        sidebarSort: sortValue
+    });
+
+    applyProfilePreferencesToChat();
+    renderConversationList();
+    updateSidebarButtonLabel();
+    showAlert('Settings saved.', 'success');
+}
+
+async function syncConversationsFromMessages() {
+    if (!sb || !currentUser) return;
+
+    const previousMetaMap = new Map(conversationMetaMap);
+
+    const { data, error } = await sb
+        .from('messages')
+        .select('sender_id, recipient_id, content, created_at')
+        .or(`sender_id.eq.${currentUser.id},recipient_id.eq.${currentUser.id}`)
+        .order('created_at', { ascending: false })
+        .limit(250);
+
+    if (error) {
+        console.error('Conversation sync failed:', error);
+        return;
+    }
+
+    const partnerMap = new Map();
+    (data || []).forEach(msg => {
+        const partnerId = msg.sender_id === currentUser.id ? msg.recipient_id : msg.sender_id;
+        if (!partnerId || partnerId === currentUser.id || partnerMap.has(partnerId)) return;
+        partnerMap.set(partnerId, {
+            lastMessage: msg.content || '',
+            createdAt: msg.created_at || null,
+            senderId: msg.sender_id
+        });
+    });
+
+    const partnerIds = [...partnerMap.keys()];
+    if (!partnerIds.length) {
+        conversationMetaMap = new Map();
+        renderConversationList();
+        return;
+    }
+
+    const { data: profiles } = await sb
+        .from('profiles')
+        .select('id, username')
+        .in('id', partnerIds);
+
+    const nameMap = new Map((profiles || []).map(p => [p.id, p.username || 'user']));
+    const synced = partnerIds.map(id => ({ id, username: nameMap.get(id) || 'user' }));
+
+    const existing = loadRecentConversations();
+    const existingOnly = existing.filter(c => !partnerMap.has(c.id));
+    const merged = [...synced, ...existingOnly].slice(0, 20);
+
+    saveRecentConversations(merged);
+
+    if (hasConversationBootstrap) {
+        partnerIds.forEach(id => {
+            const prevMeta = previousMetaMap.get(id);
+            const nextMeta = partnerMap.get(id);
+            if (!nextMeta?.createdAt) return;
+
+            const prevTs = prevMeta?.createdAt ? new Date(prevMeta.createdAt).getTime() : 0;
+            const nextTs = new Date(nextMeta.createdAt).getTime();
+            if (nextTs > prevTs) {
+                trackIncomingMessage(id, nextMeta.lastMessage, nextMeta.createdAt, nextMeta.senderId);
+            }
+        });
+    }
+
+    conversationMetaMap = new Map(partnerIds.map(id => [id, partnerMap.get(id)]));
+    hasConversationBootstrap = true;
+    renderConversationList();
 }
 
 function selectInitialConversation() {
@@ -119,11 +567,9 @@ function selectInitialConversation() {
 
 function saveRecentConversation(userId, username) {
     if (!currentUser || !userId || !username) return;
-    const key = getConversationStorageKey();
-    if (!key) return;
     const existing = loadRecentConversations().filter(c => c.id !== userId);
     const updated = [{ id: userId, username }, ...existing].slice(0, 20);
-    localStorage.setItem(key, JSON.stringify(updated));
+    saveRecentConversations(updated);
     renderConversationList();
 }
 
@@ -137,7 +583,7 @@ function updateChatHeader() {
         title.textContent = `Chat with @${activeChatUsername}`;
         subtitle.textContent = 'Direct message between 2 users';
     } else {
-        title.textContent = 'Nuntia DM';
+        title.textContent = 'Nuntia Direct Messages';
         subtitle.textContent = 'Select a user to start chatting';
     }
 }
@@ -146,10 +592,15 @@ function setActiveConversation(userId = null, username = null) {
     activeChatUserId = userId;
     activeChatUsername = username;
 
+    if (activeChatUserId) {
+        markConversationRead(activeChatUserId);
+    }
+
     document.querySelectorAll('.conversation-btn[data-user-id]').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.userId === userId);
     });
 
+    renderConversationList();
     updateChatHeader();
     loadMessages();
 }
@@ -158,17 +609,56 @@ function renderConversationList() {
     const list = document.getElementById('conversationList');
     if (!list) return;
 
-    const conversations = loadRecentConversations();
+    const preferences = getCurrentPreferences();
+    const pinnedSet = new Set(preferences.pinnedConversations || []);
+    const mutedMap = preferences.mutedConversations || {};
+    const sortMode = preferences.sidebarSort || 'recent';
+
+    let conversations = [...loadRecentConversations()];
     if (!conversations.length) {
         list.innerHTML = '';
         return;
     }
 
-    list.innerHTML = conversations.map(c => `
+    conversations.sort((left, right) => {
+        const leftPinned = pinnedSet.has(left.id) ? 1 : 0;
+        const rightPinned = pinnedSet.has(right.id) ? 1 : 0;
+        if (leftPinned !== rightPinned) return rightPinned - leftPinned;
+
+        if (sortMode === 'name') {
+            return String(left.username || '').localeCompare(String(right.username || ''));
+        }
+
+        const leftTime = conversationMetaMap.get(left.id)?.createdAt ? new Date(conversationMetaMap.get(left.id).createdAt).getTime() : 0;
+        const rightTime = conversationMetaMap.get(right.id)?.createdAt ? new Date(conversationMetaMap.get(right.id).createdAt).getTime() : 0;
+        if (sortMode === 'oldest') return leftTime - rightTime;
+        return rightTime - leftTime;
+    });
+
+    list.innerHTML = conversations.map(c => {
+        const meta = conversationMetaMap.get(c.id);
+        const previewPrefix = meta?.senderId === currentUser?.id ? 'You: ' : '';
+        const preview = meta?.lastMessage
+            ? `${previewPrefix}${truncateText(meta.lastMessage, 30)}`
+            : 'No messages yet';
+        const lastSeen = formatRelativeTime(meta?.createdAt);
+        const unreadCount = activeChatUserId === c.id ? 0 : (unreadConversations[c.id] || 0);
+        const isPinned = pinnedSet.has(c.id);
+        const isMuted = Boolean(mutedMap[c.id]);
+
+        return `
         <button class="conversation-btn ${activeChatUserId === c.id ? 'active' : ''}" data-user-id="${c.id}" data-username="${escapeHtml(c.username)}" type="button">
-            @${escapeHtml(c.username)}
+            <span class="conversation-title">${isPinned ? '📌 ' : ''}@${escapeHtml(c.username)}${isMuted ? ' 🔕' : ''}</span>
+            <span class="conversation-meta">
+                <span class="conversation-preview">${escapeHtml(preview)}</span>
+                <span class="conversation-meta-right">
+                    ${lastSeen ? `<span class="conversation-time">${lastSeen}</span>` : ''}
+                    ${unreadCount > 0 ? `<span class="conversation-unread">${unreadCount}</span>` : ''}
+                </span>
+            </span>
         </button>
-    `).join('');
+    `;
+    }).join('');
 
     list.querySelectorAll('.conversation-btn[data-user-id]').forEach(btn => {
         btn.onclick = () => {
@@ -305,6 +795,18 @@ async function ensureProfilesEmailColumn() {
     }
 }
 
+async function ensureProfilesPreferencesColumn() {
+    try {
+        await sb.rpc("exec_sql", {
+            sql: `
+                ALTER TABLE profiles ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}'::jsonb;
+            `
+        });
+    } catch (_error) {
+        console.log("profiles.preferences migration skipped");
+    }
+}
+
 // ===== AUTHENTICATION =====
 async function handleLogin() {
     if (!sb) {
@@ -412,7 +914,13 @@ async function handleRegister() {
 async function createProfile(userId, username, email) {
     let { error } = await sb
         .from("profiles")
-        .upsert({ id: userId, username: username, email: email, status: "online" });
+        .upsert({
+            id: userId,
+            username: username,
+            email: email,
+            status: "online",
+            preferences: { ...DEFAULT_PROFILE_PREFERENCES }
+        });
 
     // Compatibility with older schemas that don't yet include profiles.email.
     if (error) {
@@ -447,14 +955,236 @@ async function handleLogout() {
     }
 
     await sb.auth.signOut();
+    stopLiveSync();
     if (realtimeChannel) {
         sb.removeChannel(realtimeChannel);
         realtimeChannel = null;
     }
     currentUser = null;
     messages = [];
+    unreadConversations = {};
+    conversationMetaMap = new Map();
+    hasConversationBootstrap = false;
+    lastIncomingSeenByPartner = {};
+    profileCache = null;
     showScreen("authScreen");
     showAlert("Logged out successfully", "success");
+}
+
+async function loadActivityStats() {
+    if (!sb || !currentUser) {
+        return { sent: 0, received: 0, contacts: 0 };
+    }
+
+    const [{ count: sentCount }, { count: receivedCount }, { data: contactRows }] = await Promise.all([
+        sb
+            .from("messages")
+            .select("id", { count: "exact", head: true })
+            .eq("sender_id", currentUser.id),
+        sb
+            .from("messages")
+            .select("id", { count: "exact", head: true })
+            .eq("recipient_id", currentUser.id),
+        sb
+            .from("messages")
+            .select("sender_id, recipient_id")
+            .or(`sender_id.eq.${currentUser.id},recipient_id.eq.${currentUser.id}`)
+            .limit(1000)
+    ]);
+
+    const contactSet = new Set();
+    (contactRows || []).forEach(row => {
+        const contactId = row.sender_id === currentUser.id ? row.recipient_id : row.sender_id;
+        if (contactId && contactId !== currentUser.id) contactSet.add(contactId);
+    });
+
+    return {
+        sent: sentCount || 0,
+        received: receivedCount || 0,
+        contacts: contactSet.size
+    };
+}
+
+function renderProfileContent() {
+    const container = document.getElementById('profileContent');
+    if (!container) return;
+
+    const profile = profileCache || {};
+    const preferences = normalizeProfilePreferences(profile.preferences);
+    const emailText = currentUser?.email || 'Not available';
+    const joinedText = currentUser?.created_at
+        ? new Date(currentUser.created_at).toLocaleDateString()
+        : '-';
+
+    if (activeProfileTab === 'account') {
+        container.innerHTML = `
+            <div class="form-card profile-container">
+                <div class="form-group">
+                    <label for="profileUsernameInput">Username</label>
+                    <input type="text" id="profileUsernameInput" class="form-input" placeholder="Your username" title="Username" value="${escapeHtml(profile.username || '')}">
+                </div>
+                <div class="form-group">
+                    <label for="profileStatusInput">Status</label>
+                    <select id="profileStatusInput" class="form-input" title="Status">
+                        <option value="online" ${profile.status === 'online' ? 'selected' : ''}>🟢 Online</option>
+                        <option value="away" ${profile.status === 'away' ? 'selected' : ''}>🌙 Away</option>
+                        <option value="busy" ${profile.status === 'busy' ? 'selected' : ''}>🔴 Busy</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="profileBioInput">Bio</label>
+                    <textarea id="profileBioInput" class="form-textarea profile-bio" rows="3" placeholder="Tell people about yourself" title="Bio">${escapeHtml(preferences.bio || '')}</textarea>
+                </div>
+                <div class="form-group">
+                    <label for="profileMoodInput">Mood Emoji</label>
+                    <input type="text" id="profileMoodInput" class="form-input" maxlength="2" placeholder="🙂" title="Mood" value="${escapeHtml(preferences.mood || '🙂')}">
+                </div>
+                <button id="updateProfileBtn" class="btn btn-primary">Save Account</button>
+            </div>
+        `;
+        return;
+    }
+
+    if (activeProfileTab === 'preferences') {
+        container.innerHTML = `
+            <div class="form-card profile-container">
+                <div class="form-group">
+                    <label for="bubbleStyleInput">Message Bubble Style</label>
+                    <select id="bubbleStyleInput" class="form-input" title="Bubble style">
+                        <option value="rounded" ${preferences.bubbleStyle === 'rounded' ? 'selected' : ''}>Rounded</option>
+                        <option value="square" ${preferences.bubbleStyle === 'square' ? 'selected' : ''}>Square</option>
+                    </select>
+                </div>
+                <div class="form-group checkbox-row">
+                    <input type="checkbox" id="compactModeInput" ${preferences.compactMode ? 'checked' : ''}>
+                    <label for="compactModeInput">Compact message spacing</label>
+                </div>
+                <div class="form-group checkbox-row">
+                    <input type="checkbox" id="readReceiptsInput" ${preferences.readReceipts ? 'checked' : ''}>
+                    <label for="readReceiptsInput">Enable read receipts (local setting)</label>
+                </div>
+                <button id="saveProfilePreferencesBtn" class="btn btn-primary">Save Preferences</button>
+            </div>
+        `;
+        return;
+    }
+
+    if (activeProfileTab === 'settings') {
+        const isActivePinned = activeChatUserId ? getPinnedConversations().includes(activeChatUserId) : false;
+        const isActiveMuted = activeChatUserId ? Boolean(getMutedConversations()[activeChatUserId]) : false;
+
+        container.innerHTML = `
+            <div class="form-card profile-container">
+                <div class="settings-section">
+                    <h3>Account Management</h3>
+                    <div class="settings-grid">
+                        <button id="btn-settings-account" class="btn btn-secondary" type="button">👤 Account Info</button>
+                        <button id="btn-settings-preferences" class="btn btn-secondary" type="button">⚙️ Preferences</button>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>Privacy & Safety</h3>
+                    <div class="settings-grid">
+                        <button id="openTermsFromSettings" class="btn btn-secondary" type="button">🔒 Terms & Privacy</button>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>App Preferences</h3>
+                    <div class="form-group">
+                        <label><input type="radio" name="pref-theme-chat" value="light" ${preferences.theme !== 'dark' ? 'checked' : ''}> ☀️ Light Theme</label>
+                    </div>
+                    <div class="form-group">
+                        <label><input type="radio" name="pref-theme-chat" value="dark" ${preferences.theme === 'dark' ? 'checked' : ''}> 🌙 Dark Theme</label>
+                    </div>
+                    <div class="form-group checkbox-row">
+                        <input type="checkbox" id="prefNotificationsToggle" ${preferences.notifications !== false ? 'checked' : ''}>
+                        <label for="prefNotificationsToggle">Enable notifications</label>
+                    </div>
+                    <div class="form-group">
+                        <label for="sidebarSortSelect">Direct Message Sort</label>
+                        <select id="sidebarSortSelect" class="form-input" title="Direct message sort mode">
+                            <option value="recent" ${preferences.sidebarSort === 'recent' ? 'selected' : ''}>Recent first</option>
+                            <option value="oldest" ${preferences.sidebarSort === 'oldest' ? 'selected' : ''}>Oldest first</option>
+                            <option value="name" ${preferences.sidebarSort === 'name' ? 'selected' : ''}>Name (A-Z)</option>
+                        </select>
+                    </div>
+                    <div class="settings-grid">
+                        <button id="btn-save-advanced-settings" class="btn btn-primary" type="button">💾 Save App Settings</button>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>Conversation Tools</h3>
+                    <div class="settings-grid">
+                        <button id="btn-pin-active-chat" class="btn btn-secondary" type="button">${isActivePinned ? '📌 Unpin Active Chat' : '📌 Pin Active Chat'}</button>
+                        <button id="btn-mute-active-chat" class="btn btn-secondary" type="button">${isActiveMuted ? '🔔 Unmute Active Chat' : '🔕 Mute Active Chat'}</button>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>Security</h3>
+                    <div class="form-group">
+                        <label for="settingsNewPassword">New Password</label>
+                        <input type="password" id="settingsNewPassword" class="form-input" placeholder="Enter new password">
+                    </div>
+                    <div class="form-group">
+                        <label for="settingsConfirmPassword">Confirm Password</label>
+                        <input type="password" id="settingsConfirmPassword" class="form-input" placeholder="Confirm new password">
+                    </div>
+                    <div class="settings-grid">
+                        <button id="btn-change-password-settings" class="btn btn-warning" type="button">🔐 Update Password</button>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>Session</h3>
+                    <div class="settings-grid">
+                        <button id="btn-profile-toggle-theme" class="btn btn-secondary" type="button">🌙 Toggle Theme</button>
+                        <button id="btn-profile-logout" class="btn btn-danger" type="button">🚪 Logout</button>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>Data</h3>
+                    <div class="settings-grid">
+                        <button id="btn-reset-chat-preferences" class="btn btn-warning" type="button">♻️ Reset Cloud Sync Cache</button>
+                        <button id="btn-export-my-data" class="btn btn-secondary" type="button">📤 Export My Data</button>
+                    </div>
+                    <p class="settings-note">Resets conversation sync metadata in your profile preferences and can export settings JSON.</p>
+                </div>
+
+                <div class="settings-section">
+                    <h3>About</h3>
+                    <p class="settings-note"><strong>Nuntia v0.1.0</strong><br>connect · share · belong</p>
+                </div>
+            </div>
+        `;
+        return;
+    }
+
+    container.innerHTML = `
+        <div class="form-card profile-container profile-stats-card">
+            <h3 class="profile-stats-title">Account Stats</h3>
+            <div class="stats-grid">
+                <div class="stat-card"><div class="stat-value" id="statSent">-</div><div class="stat-label">Messages Sent</div></div>
+                <div class="stat-card"><div class="stat-value" id="statReceived">-</div><div class="stat-label">Messages Received</div></div>
+                <div class="stat-card"><div class="stat-value" id="statContacts">-</div><div class="stat-label">Unique Contacts</div></div>
+            </div>
+            <p id="userEmail" class="profile-stats-row">📧 ${escapeHtml(emailText)}</p>
+            <p id="memberSince" class="profile-stats-row">📅 Joined ${escapeHtml(joinedText)}</p>
+        </div>
+    `;
+
+    loadActivityStats().then(stats => {
+        const sent = document.getElementById('statSent');
+        const received = document.getElementById('statReceived');
+        const contacts = document.getElementById('statContacts');
+        if (sent) sent.textContent = String(stats.sent);
+        if (received) received.textContent = String(stats.received);
+        if (contacts) contacts.textContent = String(stats.contacts);
+    }).catch(() => {});
 }
 
 async function loadUserProfile() {
@@ -464,33 +1194,115 @@ async function loadUserProfile() {
         .eq("id", currentUser.id)
         .single();
     
+    if (error) {
+        console.error('Profile load failed:', error);
+        return;
+    }
+
     if (data) {
-        const profileUsername = document.getElementById("profileUsername");
-        const profileStatus = document.getElementById("profileStatus");
-        const userEmail = document.getElementById("userEmail");
-        const memberSince = document.getElementById("memberSince");
-        
-        if (profileUsername) profileUsername.value = data.username || "";
-        if (profileStatus) profileStatus.value = data.status || "online";
-        if (userEmail) userEmail.textContent = `📧 ${currentUser.email}`;
-        if (memberSince) memberSince.textContent = `📅 Joined ${new Date(currentUser.created_at).toLocaleDateString()}`;
+        profileCache = {
+            ...data,
+            preferences: normalizeProfilePreferences(data.preferences)
+        };
+
+        unreadConversations = profileCache.preferences.unreadConversations || {};
+        lastIncomingSeenByPartner = profileCache.preferences.incomingSeen || {};
+
+        const profileHeaderName = document.getElementById("profileHeaderName");
+        if (profileHeaderName) profileHeaderName.textContent = data.username ? `@${data.username}` : 'Profile';
+        applyProfilePreferencesToChat();
+        renderConversationList();
+        renderProfileContent();
     }
 }
 
 async function updateProfile() {
-    const username = document.getElementById("profileUsername").value;
-    const status = document.getElementById("profileStatus").value;
+    const usernameInput = document.getElementById("profileUsernameInput");
+    const statusInput = document.getElementById("profileStatusInput");
+    const bioInput = document.getElementById("profileBioInput");
+    const moodInput = document.getElementById("profileMoodInput");
+
+    if (!usernameInput || !statusInput) return;
+
+    const username = usernameInput.value.trim();
+    const status = statusInput.value;
+    const preferences = {
+        ...normalizeProfilePreferences(profileCache?.preferences),
+        bio: bioInput ? bioInput.value.trim() : '',
+        mood: moodInput ? (moodInput.value.trim() || '🙂') : '🙂'
+    };
     
-    const { error } = await sb
+    let { error } = await sb
         .from("profiles")
-        .update({ username, status })
+        .update({ username, status, preferences })
         .eq("id", currentUser.id);
+
+    if (error && String(error.message || '').toLowerCase().includes('preferences')) {
+        const retry = await sb
+            .from("profiles")
+            .update({ username, status })
+            .eq("id", currentUser.id);
+        error = retry.error;
+    }
     
     if (error) {
         showAlert(error.message, "error");
     } else {
+        const profileHeaderName = document.getElementById("profileHeaderName");
+        if (profileHeaderName) profileHeaderName.textContent = username ? `@${username}` : 'Profile';
+        profileCache = {
+            ...(profileCache || {}),
+            username,
+            status,
+            preferences
+        };
+        saveProfilePreferencesToDb(preferences);
         showAlert("Profile updated!", "success");
+        await syncConversationsFromMessages();
+        renderProfileContent();
     }
+}
+
+async function saveProfilePreferences() {
+    const bubbleStyleInput = document.getElementById('bubbleStyleInput');
+    const compactModeInput = document.getElementById('compactModeInput');
+    const readReceiptsInput = document.getElementById('readReceiptsInput');
+
+    const preferences = {
+        ...normalizeProfilePreferences(profileCache?.preferences),
+        bubbleStyle: bubbleStyleInput?.value === 'square' ? 'square' : 'rounded',
+        compactMode: Boolean(compactModeInput?.checked),
+        readReceipts: Boolean(readReceiptsInput?.checked)
+    };
+
+    let { error } = await sb
+        .from('profiles')
+        .update({ preferences })
+        .eq('id', currentUser.id);
+
+    if (error && String(error.message || '').toLowerCase().includes('preferences')) {
+        error = null;
+    }
+
+    if (error) {
+        showAlert(error.message, 'error');
+        return;
+    }
+
+    profileCache = {
+        ...(profileCache || {}),
+        preferences
+    };
+    saveProfilePreferencesToDb(preferences);
+    applyProfilePreferencesToChat();
+    showAlert('Preferences saved!', 'success');
+}
+
+function applyProfilePreferencesToChat() {
+    const preferences = normalizeProfilePreferences(profileCache?.preferences);
+    document.body.classList.toggle('dark-theme', preferences.theme === 'dark');
+    document.body.classList.toggle('chat-compact-mode', Boolean(preferences.compactMode));
+    document.body.classList.toggle('chat-square-bubbles', preferences.bubbleStyle === 'square');
 }
 
 // ===== MESSAGES =====
@@ -588,6 +1400,7 @@ async function sendMessage() {
         const replyPreview = document.getElementById("replyPreview");
         if (replyPreview) replyPreview.style.display = "none";
         await updateTypingStatus(false);
+        await syncConversationsFromMessages();
         await loadMessages();
     }
 }
@@ -857,25 +1670,93 @@ async function setupRealtime() {
     realtimeChannel = sb
         .channel('messages-channel')
         .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, 
-            () => loadMessages())
+            async (payload) => {
+                const row = payload?.new || payload?.old;
+                const partnerId = row
+                    ? (row.sender_id === currentUser?.id ? row.recipient_id : row.sender_id)
+                    : null;
+
+                if (
+                    payload?.eventType === 'INSERT' &&
+                    row?.recipient_id === currentUser?.id &&
+                    row?.sender_id !== currentUser?.id &&
+                    partnerId &&
+                    partnerId !== activeChatUserId
+                ) {
+                    trackIncomingMessage(partnerId, row?.content, row?.created_at, row?.sender_id);
+                }
+
+                await syncConversationsFromMessages();
+
+                if (!partnerId || !activeChatUserId || partnerId === activeChatUserId) {
+                    await loadMessages();
+                }
+            })
         .on('postgres_changes', { event: '*', schema: 'public', table: 'message_reactions' },
             () => loadMessages())
         .subscribe();
 }
 
+function setProfileTab(tabName) {
+    activeProfileTab = tabName;
+    document.querySelectorAll('[data-profile-tab]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.profileTab === tabName);
+    });
+    renderProfileContent();
+}
+
 // ===== THEME =====
 function initTheme() {
-    const savedTheme = localStorage.getItem('theme');
-    if (savedTheme === 'dark') {
+    if (getCurrentPreferences().theme === 'dark') {
         document.body.classList.add('dark-theme');
+    } else {
+        document.body.classList.remove('dark-theme');
     }
 }
 
 function toggleTheme() {
     document.body.classList.toggle('dark-theme');
     const isDark = document.body.classList.contains('dark-theme');
-    localStorage.setItem('theme', isDark ? 'dark' : 'light');
+    queuePreferencesPersist({ theme: isDark ? 'dark' : 'light' });
 }
+
+function resetDatabaseSyncCache() {
+    if (!currentUser) return;
+
+    unreadConversations = {};
+    lastIncomingSeenByPartner = {};
+    conversationMetaMap = new Map();
+    hasConversationBootstrap = false;
+    profileCache = {
+        ...(profileCache || {}),
+        preferences: {
+            ...normalizeProfilePreferences(profileCache?.preferences),
+            recentConversations: [],
+            unreadConversations: {},
+            incomingSeen: {}
+        }
+    };
+
+    saveProfilePreferencesToDb(profileCache.preferences);
+
+    renderConversationList();
+    renderProfileContent();
+    showAlert('Cloud sync cache reset complete.', 'success');
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+    setTimeout(removeSplash, 2000);
+
+    if ('Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission().catch(() => {});
+    }
+
+    updateSidebarButtonLabel();
+});
+
+window.addEventListener('load', () => {
+    setTimeout(removeSplash, 2500);
+});
 
 // ===== EVENT LISTENERS =====
 document.addEventListener("DOMContentLoaded", () => {
@@ -897,15 +1778,71 @@ document.addEventListener("DOMContentLoaded", () => {
     };
     
     // Logout buttons
-    const logoutBtns = ["btn-logout", "btn-logout-profile", "logout-sidebar"];
+    const logoutBtns = ["btn-logout", "logout-sidebar"];
     logoutBtns.forEach(id => {
         const btn = document.getElementById(id);
         if (btn) btn.onclick = handleLogout;
     });
+
+    const profileSettingsBtn = document.getElementById('btn-profile-settings');
+    if (profileSettingsBtn) {
+        profileSettingsBtn.onclick = () => {
+            setProfileTab('settings');
+        };
+    }
+
+    document.querySelectorAll('[data-profile-tab]').forEach(btn => {
+        btn.onclick = () => setProfileTab(btn.dataset.profileTab);
+    });
     
     // Profile update
-    const updateProfileBtn = document.getElementById("updateProfileBtn");
-    if (updateProfileBtn) updateProfileBtn.onclick = updateProfile;
+    document.addEventListener('click', (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement)) return;
+        if (target.id === 'updateProfileBtn') {
+            updateProfile();
+        }
+        if (target.id === 'saveProfilePreferencesBtn') {
+            saveProfilePreferences();
+        }
+        if (target.id === 'btn-settings-account') {
+            setProfileTab('account');
+        }
+        if (target.id === 'btn-settings-preferences') {
+            setProfileTab('preferences');
+        }
+        if (target.id === 'openTermsFromSettings' || target.id === 'terms-link-login' || target.id === 'terms-link-register') {
+            openTermsModal();
+        }
+        if (target.id === 'btn-agree-terms' || target.id === 'btn-close-terms') {
+            closeModal('termsModal');
+        }
+        if (target.id === 'btn-profile-toggle-theme') {
+            toggleTheme();
+            updateSidebarButtonLabel();
+        }
+        if (target.id === 'btn-profile-logout') {
+            handleLogout();
+        }
+        if (target.id === 'btn-reset-chat-preferences') {
+            resetDatabaseSyncCache();
+        }
+        if (target.id === 'btn-save-advanced-settings') {
+            saveAdvancedSettings();
+        }
+        if (target.id === 'btn-pin-active-chat') {
+            togglePinActiveConversation();
+        }
+        if (target.id === 'btn-mute-active-chat') {
+            toggleMuteActiveConversation();
+        }
+        if (target.id === 'btn-change-password-settings') {
+            changePasswordFromSettings();
+        }
+        if (target.id === 'btn-export-my-data') {
+            exportMyData();
+        }
+    });
     
     // Send message
     const sendBtn = document.getElementById("sendBtn");
@@ -936,17 +1873,20 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     
     // Theme toggles
-    const themeBtns = ["theme-toggle-sidebar", "theme-toggle-chat", "theme-toggle-profile"];
+    const themeBtns = ["theme-toggle-sidebar", "theme-toggle-chat"];
     themeBtns.forEach(id => {
         const btn = document.getElementById(id);
-        if (btn) btn.onclick = toggleTheme;
+        if (btn) btn.onclick = () => {
+            toggleTheme();
+            updateSidebarButtonLabel();
+        };
     });
     
     // Modal close buttons
     document.querySelectorAll(".close-btn").forEach(btn => {
         btn.onclick = () => {
-            closeModal("reactionModal");
-            closeModal("editModal");
+            const modal = btn.closest('.modal');
+            if (modal?.id) closeModal(modal.id);
         };
     });
     
@@ -978,7 +1918,7 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     
     // Navigation
-    document.querySelectorAll(".nav-btn[data-view]").forEach(btn => {
+    document.querySelectorAll("[data-view]").forEach(btn => {
         btn.onclick = () => {
             const view = btn.dataset.view;
             if (view === "chats") {
@@ -997,6 +1937,18 @@ document.addEventListener("DOMContentLoaded", () => {
             renderUserSearchResults(users);
         };
     }
+
+    document.addEventListener('keydown', (event) => {
+        const userSearch = document.getElementById('userSearchInput');
+        if (!userSearch) return;
+
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+            event.preventDefault();
+            showScreen('chatScreen');
+            userSearch.focus();
+            userSearch.select();
+        }
+    });
     
     // Password toggles
     document.querySelectorAll(".toggle-password").forEach(btn => {
@@ -1023,19 +1975,28 @@ async function initApp() {
     sb.auth.onAuthStateChange(async (event, session) => {
         if (session) {
             currentUser = session.user;
+            unreadConversations = loadUnreadConversations();
+            lastIncomingSeenByPartner = loadIncomingSeenMap();
             await ensureProfile();
             await setupRealtime();
-            renderConversationList();
+            await syncConversationsFromMessages();
+            startLiveSync();
             showScreen("chatScreen");
             selectInitialConversation();
             await loadMessages();
             await loadUserProfile();
+            applyProfilePreferencesToChat();
         } else {
+            stopLiveSync();
             if (realtimeChannel) {
                 sb.removeChannel(realtimeChannel);
                 realtimeChannel = null;
             }
             currentUser = null;
+            unreadConversations = {};
+            conversationMetaMap = new Map();
+            hasConversationBootstrap = false;
+            lastIncomingSeenByPartner = {};
             showScreen("authScreen");
         }
     });
@@ -1044,20 +2005,27 @@ async function initApp() {
         const { data: { session } } = await sb.auth.getSession();
         if (session) {
             currentUser = session.user;
+            unreadConversations = loadUnreadConversations();
+            lastIncomingSeenByPartner = loadIncomingSeenMap();
             await ensureProfile();
             await setupRealtime();
-            renderConversationList();
+            await syncConversationsFromMessages();
+            startLiveSync();
             showScreen("chatScreen");
             selectInitialConversation();
             await loadMessages();
             await loadUserProfile();
+            applyProfilePreferencesToChat();
         } else {
             showScreen("authScreen");
         }
+        await ensureProfilesPreferencesColumn();
+        removeSplash();
     } catch (error) {
         console.error("Session restore failed:", error);
         showScreen("authScreen");
         showAlert("Session restore failed. Please login again.", "error");
+        removeSplash();
     }
 }
 

@@ -2,34 +2,36 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Nuntia — Modern Chat</title>
+    <link rel="icon" type="image/jpeg" href="nuntia.jpeg">
+    <link rel="apple-touch-icon" href="nuntia.jpeg">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
+    <div id="splashScreen" class="splash-screen">
+        <div class="splash-content">
+            <img src="nuntia.jpeg" alt="Nuntia" class="splash-icon" width="120" height="120">
+            <h1 class="splash-title">Nuntia</h1>
+            <p class="splash-version">v0.1.0</p>
+        </div>
+    </div>
+
     <div id="app">
         <!-- Desktop Sidebar -->
         <aside class="sidebar" id="sidebar">
             <div class="sidebar-header">
                 <h1>Nuntia</h1>
                 <div class="version">v0.1.0</div>
+                <button class="conversation-btn profile-under-list" data-view="profile" type="button">👤 Profile</button>
             </div>
-            <nav class="sidebar-nav">
-                <button class="nav-btn active" data-view="chats">
-                    <span>💬</span> <span>Chats</span>
-                </button>
-                <button class="nav-btn" data-view="profile">
-                    <span>👤</span> <span>Profile</span>
-                </button>
-            </nav>
             <div class="dm-panel">
-                <div class="dm-panel-title">Direct Messages</div>
-                <div id="conversationList" class="conversation-list"></div>
                 <div class="dm-search">
                     <label for="userSearchInput">Find Username</label>
                     <input id="userSearchInput" class="form-input" type="text" placeholder="Type username...">
                     <div id="userSearchResults" class="user-search-results"></div>
                 </div>
+                <div id="conversationList" class="conversation-list"></div>
             </div>
             <div class="sidebar-footer">
                 <button id="theme-toggle-sidebar" class="sidebar-btn">🌙 Dark Mode</button>
@@ -63,6 +65,7 @@
                         <button id="btn-login" class="btn btn-primary btn-large">Login</button>
                         <div class="auth-link-section">
                             <p>No account? <button id="btn-to-register" class="link-button">Create one</button></p>
+                            <p><button id="terms-link-login" class="link-button" type="button">Terms of Service & Privacy Policy</button></p>
                         </div>
                     </div>
                     
@@ -86,6 +89,7 @@
                         <button id="btn-register" class="btn btn-primary btn-large">Sign Up</button>
                         <div class="auth-link-section">
                             <p>Already have an account? <button id="btn-to-login" class="link-button">Login</button></p>
+                            <p><button id="terms-link-register" class="link-button" type="button">Terms of Service & Privacy Policy</button></p>
                         </div>
                     </div>
                 </div>
@@ -112,7 +116,7 @@
                     </div>
                 </div>
                 <div class="typing-indicator-container" id="typingIndicator"></div>
-                <div class="reply-preview" id="replyPreview" style="display: none;">
+                <div class="reply-preview" id="replyPreview">
                     <div class="reply-preview-content">
                         <span>Replying to: <span id="replyPreviewText"></span></span>
                         <button id="cancelReply" class="btn-link">Cancel</button>
@@ -127,35 +131,17 @@
             <!-- Profile Screen -->
             <div id="profileScreen" class="screen hidden">
                 <div class="header">
-                    <h1>Profile</h1>
-                    <div class="header-actions">
-                        <button id="theme-toggle-profile" class="header-icon-btn">🌙</button>
-                        <button id="btn-logout-profile" class="header-icon-btn danger">🚪</button>
-                    </div>
+                    <h1 id="profileHeaderName">Profile</h1>
+                    <button id="btn-profile-settings" class="header-icon-btn" title="Profile settings">⚙️</button>
                 </div>
                 <div class="content">
-                    <div class="profile-container">
-                        <div class="form-card">
-                            <div class="form-group">
-                                <label>Username</label>
-                                <input type="text" id="profileUsername" class="form-input">
-                            </div>
-                            <div class="form-group">
-                                <label>Status</label>
-                                <select id="profileStatus" class="form-input">
-                                    <option value="online">🟢 Online</option>
-                                    <option value="away">🌙 Away</option>
-                                    <option value="busy">🔴 Busy</option>
-                                </select>
-                            </div>
-                            <button id="updateProfileBtn" class="btn btn-primary">Update Profile</button>
-                        </div>
-                        <div class="form-card" style="margin-top: 20px;">
-                            <h3 style="margin-bottom: 15px;">Account Stats</h3>
-                            <p id="userEmail" style="margin-bottom: 10px;"></p>
-                            <p id="memberSince"></p>
-                        </div>
+                    <div class="profile-tabs">
+                        <button class="tab-btn active" data-profile-tab="account" type="button">Account</button>
+                        <button class="tab-btn" data-profile-tab="preferences" type="button">Preferences</button>
+                        <button class="tab-btn" data-profile-tab="activity" type="button">Activity</button>
+                        <button class="tab-btn" data-profile-tab="settings" type="button">Settings</button>
                     </div>
+                    <div id="profileContent" class="profile-content"></div>
                 </div>
             </div>
         </main>
@@ -194,11 +180,24 @@
                 <button class="close-btn">&times;</button>
             </div>
             <div class="modal-body">
-                <textarea id="editMessageText" class="form-textarea" rows="3"></textarea>
+                <textarea id="editMessageText" class="form-textarea" rows="3" placeholder="Edit your message" title="Edit message"></textarea>
             </div>
             <div class="modal-footer">
                 <button id="saveEditBtn" class="btn btn-primary">Save</button>
                 <button id="cancelEditBtn" class="btn btn-secondary">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="termsModal" class="modal hidden">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h2>Terms of Service & Privacy Policy</h2>
+                <button class="close-btn" id="btn-close-terms" type="button">&times;</button>
+            </div>
+            <div class="modal-body scrollable" id="termsContent"></div>
+            <div class="modal-footer">
+                <button id="btn-agree-terms" class="btn btn-primary" type="button">I Understand and Agree</button>
             </div>
         </div>
     </div>

@@ -19,6 +19,7 @@ create table if not exists public.profiles (
   username text not null unique,
   email text,
   status text default 'online',
+  preferences jsonb default '{}'::jsonb,
   created_at timestamptz not null default now()
 );
 
@@ -130,3 +131,13 @@ python3 -m http.server 5500
 ```
 
 Open `http://localhost:5500`.
+
+## Profile features (small DB)
+
+Profile now includes Tacivio-style tabs with:
+
+- Account: username, status, bio, mood emoji
+- Preferences: compact chat mode + bubble style
+- Activity: sent/received/contacts stats
+
+These settings are stored in `profiles.preferences` (or localStorage fallback if column migration is unavailable).
